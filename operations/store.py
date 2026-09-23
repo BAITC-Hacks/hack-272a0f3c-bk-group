@@ -455,7 +455,20 @@ class OperationsStore:
 
     def journal(self):
         with self._db() as db:
-            return [dict(row) for row in db.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 200')]
+            # Keep every audit row durable. Imported card creation is already
+            # represented by the import summary in this user-facing view;
+            # filter before the limit so it cannot hide earlier work events.
+            return [dict(row) for row in db.execute('''
+                SELECT a.*,
+                       CASE WHEN a.action='import' THEN 'План закупок'
+                            ELSE 'Рабочее пространство' END AS source
+                FROM audit a
+                WHERE NOT (
+                    a.action='create' AND a.entity_type='products'
+                    AND a.entity_id IN (SELECT product_id FROM product_keys)
+                )
+                ORDER BY a.id DESC LIMIT 200
+            ''')]
 
     def overview(self):
         return self.bootstrap()['overview']

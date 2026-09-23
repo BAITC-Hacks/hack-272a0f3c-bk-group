@@ -26,6 +26,14 @@ def predict(history, target, method='adaptive'):
     return _predict(_observations(history), _ordinal(target), method)
 
 
+def _mean(values):
+    # Preserve the original arithmetic for ordinary data: even rounding-sized
+    # changes can flip a historical model-selection tie. Scaling is only the
+    # fallback when adding finite observations overflows the float range.
+    total = sum(values)
+    return total / len(values) if np.isfinite(total) else sum(value / len(values) for value in values)
+
+
 def _predict(observed, target_ordinal, method):
     # Filtering here also protects validation folds inside model selection.
     h = {month: value for month, value in observed.items() if month < target_ordinal}
@@ -39,11 +47,11 @@ def _predict(observed, target_ordinal, method):
         raise ValueError('Неизвестный метод прогноза: ' + method)
     def mean_range(first,last):
         values=[h[k] for k in range(target_ordinal-first,target_ordinal-last+1) if k in h]
-        return sum(value / len(values) for value in values) if values else None
+        return _mean(values) if values else None
     recent = mean_range(3,1)
     if recent is None:
         observed=[h[k] for k in sorted(h)[-3:]]
-        recent=sum(value / len(observed) for value in observed)
+        recent=_mean(observed)
     prior_year = h.get(target_ordinal-12)
     if method == 'mean3':
         return float(recent)

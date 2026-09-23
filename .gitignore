@@ -5,3 +5,17 @@ outputs/
 node_modules/
 .venv/
 analysis/orders_cache.pkl
+.env
+.env.*
+!.env.example
+openai-settings.json
+openai-settings.json.*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pkl
+*.zip
+*.xlsx
+*.xls
+*.log

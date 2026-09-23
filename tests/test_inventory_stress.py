@@ -1,4 +1,4 @@
-"""Synthetic operational edge cases; none of these fixtures are customer data."""
+"""Operational edge cases and a preserved SKU regression; no customer data."""
 import math
 import random
 import unittest
@@ -116,6 +116,24 @@ class InventoryStressTests(unittest.TestCase):
 
 
 class ForecastInputStressTests(unittest.TestCase):
+    def test_legacy_tie_keeps_original_arithmetic_for_preserved_sku_history(self):
+        # Systeme Electric 300200750_, Jan 2024–Mar 2025. On the final four
+        # folds mean3 and seasonal_naive both had MAE 6.416666666666667.
+        # Averaging as sum(value / n) moves one MAE by 1 ulp and wrongly
+        # changes the frozen legacy forecast from 31 / 3 to 36.
+        history = pd.Series([7., 10., 23., 36., 48., 18., 31., 25., 16., 22., 20., 20., 3., 18., 10.],
+                            index=pd.date_range('2024-01-01', periods=15, freq='MS'))
+        self.assertEqual(predict(history, pd.Timestamp('2025-04-01'), 'legacy_selected'), 31 / 3)
+
+    def test_mean_stays_finite_when_only_the_sum_overflows(self):
+        history = pd.Series([1e308] * 3, index=pd.date_range('2025-01-01', periods=3, freq='MS'))
+        # Both the calendar window and the fallback to last observed months
+        # must avoid inf without changing arithmetic for normal quantities.
+        for target in ('2025-04-01', '2026-04-01'):
+            forecast = predict(history, pd.Timestamp(target), 'mean3')
+            self.assertTrue(math.isfinite(forecast))
+            self.assertEqual(forecast, 1e308)
+
     def test_empty_and_future_only_history_remain_unknown(self):
         for history in (pd.Series(dtype=float, index=pd.DatetimeIndex([])),
             pd.Series([1000.], index=pd.to_datetime(['2027-01-01']))):

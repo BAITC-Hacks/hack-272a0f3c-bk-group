@@ -19,16 +19,18 @@ class Element{
   constructor(id=''){this.id=id;this.value='';this.disabled=false;this.dataset={};this.children=[];this.options=[];this.style={};this.textContent='';this.open=false;const values=new Set();this.classList={add:x=>values.add(x),remove:x=>values.delete(x),contains:x=>values.has(x),toggle:(x,on)=>on?values.add(x):values.delete(x)};}
   set innerHTML(value){this._html=value;this.children=[];this.options=[...value.matchAll(/<option(?:\s+value="([^"]*)")?[^>]*>([^<]*)<\/option>/g)].map(m=>({value:m[1]??m[2]}));if(this.options.length)this.value=this.options[0].value;}
   get innerHTML(){return this._html||'';}
-  append(...values){this.children.push(...values);values.forEach(v=>{if(v&&typeof v==='object')v.parent=this;});}
-  before(){} focus(){} scrollIntoView(){} setAttribute(){} addEventListener(){} insertAdjacentHTML(){}
+  append(...values){this.children.push(...values);values.forEach(v=>{if(v&&typeof v==='object'){v.parent=this;if(v.id)elements.set('#'+v.id,v);}});}
+  before(value){if(value?.id)elements.set('#'+value.id,value);} focus(){} scrollIntoView(){} setAttribute(key,value){(this.attributes??={})[key]=value;}getAttribute(key){return this.attributes?.[key];} addEventListener(){} insertAdjacentHTML(){}
   replaceChildren(...values){this.children=[];this.append(...values);}
   remove(){if(this.parent)this.parent.children=this.parent.children.filter(c=>c!==this);}
   querySelector(s){return get('#'+this.id+' '+s);}
   showModal(){this.open=true;}close(){this.open=false;}
 }
 function get(s){if(!elements.has(s))elements.set(s,new Element(s.replace(/^#/,'')));return elements.get(s);}
-const document={querySelector:get,querySelectorAll:s=>s.startsWith('#')?s.split(',').map(get):[],createElement:t=>new Element(t),createTextNode:t=>({textContent:t})};
-const context=vm.createContext({document,assert,console,AbortController,setTimeout,clearTimeout,setInterval:()=>{},devicePixelRatio:1,fetch:()=>{throw Error('Unexpected network request')},URL,FormData:class{}});
+const modeButtons=['manual','plan','ai'].map(mode=>{const button=get('[data-mode="'+mode+'"]');button.dataset.mode=mode;return button;});modeButtons[2].classList.add('hidden');modeButtons[2].disabled=true;
+const document={readyState:'loading',body:new Element('body'),getElementById:id=>get('#'+id),querySelector:get,querySelectorAll:s=>s==='[data-mode]'?modeButtons:s==='[data-mode="ai"],[data-assistant-entry]'?[modeButtons[2]]:s.startsWith('#')?s.split(',').map(get):[],createElement:t=>new Element(t),createTextNode:t=>({textContent:t})};
+const context=vm.createContext({document,assert,console,crypto:require('crypto').webcrypto,AbortController,setTimeout,clearTimeout,setInterval:()=>{},devicePixelRatio:1,fetch:()=>{throw Error('Unexpected network request')},URL,FormData:class{}});
+const events=new Map();context.window=context;context.addEventListener=(type,handler)=>{if(!events.has(type))events.set(type,[]);events.get(type).push(handler);};context.dispatchEvent=event=>{for(const handler of events.get(event.type)||[])handler(event);return true;};context.CustomEvent=class{constructor(type,options){this.type=type;this.detail=options?.detail;}};
 const html=fs.readFileSync(ROOT+'/web/index.html','utf8');
 const main=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('poll();setInterval(poll,2000);','');
 vm.runInContext(main,context);
@@ -52,6 +54,37 @@ vm.runInContext(operationsScript,context);
         source += '\nvm.runInContext('+json.dumps('(async()=>{'+script+'})()')+',context).catch(e=>{console.error(e);process.exitCode=1;});'
         result = subprocess.run([NODE, '-e', source], cwd=ROOT, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+
+    def test_manual_workspace_opens_immediately_without_configured_ai(self):
+        self.run_js("""
+            let opened=0;window.opsOpen=()=>opened++;
+            assert.equal(window.assistantReady,false);assert(document.querySelector('[data-mode="ai"]').classList.contains('hidden'));
+            api=async path=>{assert.equal(path,'/api/assistant/config');return {providers:[{id:'openai',name:'OpenAI',ready:false}]};};
+            await startWorkspace();assert.equal(opened,1);assert.equal(currentMode,'manual');assert.equal(window.isAssistantReady(),false);
+            assert(document.querySelector('[data-mode="ai"]').classList.contains('hidden'));assert($('#chat-send').disabled);
+            showMode('ai');assert.equal(currentMode,'manual');assert.equal(opened,2);assert($('#assistant-view').classList.contains('hidden'));
+            showMode('plan');assert.equal(document.querySelector('[data-mode="plan"]').getAttribute('aria-pressed'),'true');
+            assert.equal(document.querySelector('[data-mode="manual"]').getAttribute('aria-pressed'),'false');
+        """)
+
+    def test_configured_ai_is_optional_entry_with_only_openai(self):
+        self.run_js("""
+            let opened=0,readiness=[];window.opsOpen=()=>opened++;window.addEventListener('assistant-readiness',event=>readiness.push(event.detail.ready));
+            api=async path=>{assert.equal(path,'/api/assistant/config');return {providers:[{id:'openai',name:'OpenAI',ready:true},{id:'nvidia',name:'NVIDIA',ready:true}]};};
+            await startWorkspace();assert.equal(currentMode,'manual');assert.equal(opened,1);assert.equal(window.assistantReady,true);
+            assert.equal(document.querySelector('[data-mode="ai"]').classList.contains('hidden'),false);assert.equal(chatProviders[0].id,'openai');
+            assert.equal(chatProviders.length,1);assert.equal($('#chat-send').disabled,false);assert.deepEqual(readiness,[true]);
+            showMode('ai');assert.equal(currentMode,'ai');assert.equal($('#assistant-view').classList.contains('hidden'),false);
+        """)
+
+    def test_configuration_failure_hides_ai_and_restores_manual_workspace(self):
+        self.run_js("""
+            let opened=0;window.opsOpen=()=>opened++;api=async()=>{throw Error('Configuration unavailable');};
+            await startWorkspace();assert.equal(currentMode,'manual');assert.equal(window.assistantReady,false);assert(document.querySelector('[data-mode="ai"]').classList.contains('hidden'));
+            chatProviders=[{id:'openai',name:'OpenAI',ready:true}];updateChatAvailability();currentMode='ai';
+            await loadChatConfiguration();assert.equal(currentMode,'manual');assert.equal(opened,2);assert.equal(window.assistantReady,false);
+            assert(document.querySelector('[data-mode="ai"]').classList.contains('hidden'));assert($('#assistant-view').classList.contains('hidden'));assert($('#chat-send').disabled);
+        """)
 
     def test_new_dataset_clears_old_history_and_resets_period(self):
         self.run_js("""
@@ -176,29 +209,31 @@ vm.runInContext(operationsScript,context);
             await poll();assert.equal(renders,0);assert.equal(historyLoads,1);
         """)
 
-    def test_chat_discards_response_if_report_changed_in_flight(self):
+    def test_agent_conversation_survives_forecast_refresh(self):
         self.run_js("""
             report={dataset:'data',report_revision:1,rows:[]};syncChatProducts();
-            chatProviders=[{id:'openai',ready:true}];$('#chat-provider').value='openai';updateChatAvailability();$('#chat-question').value='Question';
+            chatProviders=[{id:'openai',ready:true}];updateChatAvailability();$('#chat-question').value='Question';const conversation=chatConversationId;
             let release;api=()=>new Promise(resolve=>release=resolve);
             const pending=$('#chat-form').onsubmit({preventDefault(){}});
-            report={dataset:'data',report_revision:2,rows:[]};syncChatProducts();release({answer:'OBSOLETE ANSWER'});await pending;
-            assert.equal(chatHistory.length,0);assert.equal(chatPending,false);assert.equal($('#chat-question').value,'Question');assert($('#chat-error').textContent.includes('данные изменились'));
+            report={dataset:'data',report_revision:2,rows:[]};syncChatProducts();release({conversation_id:conversation,answer:'Server-side agent context',proposals:[]});await pending;
+            assert.equal(chatConversationId,conversation);assert.equal(chatRetry,null);assert.equal(chatPending,false);assert.equal($('#chat-question').value,'');assert($('#chat-error').classList.contains('hidden'));
         """)
 
-    def test_late_configuration_cannot_switch_pending_chat_provider(self):
+    def test_late_configuration_cannot_overwrite_newer_settings(self):
         self.run_js("""
-            $('#chat-provider').value='nvidia';let release;api=()=>new Promise(resolve=>release=resolve);
-            const pending=loadChatConfiguration();chatPending=true;release({providers:[{id:'openai',ready:true}]});await pending;
-            assert.equal($('#chat-provider').value,'nvidia');
+            let release;api=()=>new Promise(resolve=>release=resolve);
+            const pending=loadChatConfiguration();chatConfigurationRequest++;
+            applyChatConfiguration({providers:[{id:'openai',name:'OpenAI',ready:true}],settings:{model:'new-model'}});
+            release({providers:[{id:'openai',name:'OpenAI',ready:false}],settings:{model:'old-model'}});await pending;
+            assert.equal(window.isAssistantReady(),true);assert.equal(chatSettings.model,'new-model');
         """)
 
     def test_failed_chat_restores_controls_and_retains_question_for_retry(self):
         self.run_js("""
-            chatProviders=[{id:'openai',ready:true}];$('#chat-provider').value='openai';updateChatAvailability();$('#chat-question').value='Retry question';
+            chatProviders=[{id:'openai',ready:true}];updateChatAvailability();$('#chat-question').value='Retry question';
             api=async()=>{throw Error('Provider timeout');};await $('#chat-form').onsubmit({preventDefault(){}});
             assert.equal(chatPending,false);assert.equal($('#chat-send').disabled,false);assert.equal($('#chat-question').disabled,false);
-            assert.equal($('#chat-question').value,'Retry question');assert.equal(chatHistory.length,0);assert.equal($('#chat-error').textContent,'Provider timeout');
+            assert.equal($('#chat-question').value,'Retry question');assert.equal(chatRetry.message,'Retry question');assert.equal($('#chat-error').textContent,'Provider timeout');
         """)
 
     def test_malformed_json_has_readable_retry_error(self):

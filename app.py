@@ -21,7 +21,9 @@ from procurement.engine import build_report, prepare_lines, validate_settings, D
 from procurement.export import export_zip, export_xlsx
 from procurement.storage import Store
 from procurement.history import run_history, validate_period
-from procurement.assistant import answer as assistant_answer, configuration as assistant_configuration
+from procurement.agent import AgentService
+from procurement.agent_settings import OpenAISettings
+from procurement.agent_tools import AgentTools
 from operations import OperationsStore
 
 ROOT=Path(__file__).resolve().parent
@@ -126,6 +128,8 @@ class Application:
         self.message='Ожидание загрузки'
         self.error=None
         self.lock=threading.Lock()
+        self.agent=AgentService(OpenAISettings(self.state_dir),
+                                AgentTools(self.operations,lambda:None if self.busy else self.report))
 
     def request_revision(self,request):
         if self.report is None:
@@ -339,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send((ROOT/'web'/url.path[1:]).read_bytes(),
                           'text/javascript; charset=utf-8' if url.path.endswith('.js') else 'text/css; charset=utf-8')
             elif url.path=='/api/assistant/config':
-                self.send(encode({'providers':assistant_configuration()}))
+                self.send(encode(app.agent.configuration()))
             elif url.path.startswith('/api/operations/'):
                 query=parse_qs(url.query)
                 if url.path=='/api/operations/bootstrap':
@@ -405,6 +409,8 @@ class Handler(BaseHTTPRequestHandler):
             length=int(self.headers.get('Content-Length','0'))
             if self.path=='/api/chat' and length>200_000:
                 raise ValueError('Слишком длинный диалог')
+            if self.path.startswith(('/api/agent/','/api/assistant/')) and length>50_000:
+                raise ValueError('Запрос к агенту слишком большой')
             if self.path.startswith('/api/operations/') and length>2_000_000:
                 raise ValueError('Документ слишком большой')
             if not 0<length<=50_000_000:
@@ -438,10 +444,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Неизвестное действие учёта')
                 self.send(encode(result))
                 return
-            elif self.path=='/api/chat':
-                if app.busy:
-                    raise ValueError('Дождитесь завершения расчёта и повторите вопрос.')
-                self.send(encode(assistant_answer(request,app.report,encode)))
+            elif self.path in ('/api/chat','/api/agent/chat'):
+                self.send(encode(app.agent.chat(request)))
+                return
+            elif self.path=='/api/assistant/configure':
+                self.send(encode(app.agent.configure(request)))
+                return
+            elif self.path=='/api/assistant/test':
+                self.send(encode(app.agent.test_connection()))
+                return
+            elif self.path in ('/api/agent/confirm','/api/agent/decline'):
+                self.send(encode(app.agent.act(request,self.path.rsplit('/',1)[-1])))
                 return
             elif self.path=='/api/calculate':
                 expected=app.request_revision(request)
@@ -477,9 +490,11 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8765)
     parser.add_argument('--archives',nargs='*')
+    parser.add_argument('--no-auto-load',action='store_true',
+                        help='Start without loading default archives from Downloads')
     parser.add_argument('--state-dir',default=str(ROOT/'data'))
     args=parser.parse_args()
-    paths=[Path(p) for p in args.archives] if args.archives else default_paths()
+    paths=[Path(p) for p in args.archives] if args.archives else ([] if args.no_auto_load else default_paths())
     application=Application(paths,args.state_dir)
     server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
     server.application=application

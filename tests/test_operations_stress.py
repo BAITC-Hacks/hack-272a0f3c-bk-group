@@ -251,6 +251,54 @@ class OperationsStressTests(unittest.TestCase):
         self.assertEqual(current['version'], 2)
         self.assertIn(current['price'], ('10.00', '20.00'))
 
+    def test_imported_product_creates_collapse_to_summary_without_hiding_manual_event(self):
+        before = {row['id'] for row in self.store.journal()}
+        manual = self.store.save_entity('warehouses', {'name': 'Созданный склад'})
+        self.store.import_products([{'key': f'synthetic|{number}|шт', 'name': f'Импорт {number}',
+                                     'sku': f'IMPORTED-{number}', 'unit': 'шт'} for number in range(3)])
+        added = [row for row in self.store.journal() if row['id'] not in before]
+        self.assertEqual(len(added), 2)
+        self.assertEqual(added[0]['action'], 'import')
+        self.assertEqual(added[0]['source'], 'План закупок')
+        self.assertEqual(added[1]['entity_id'], manual['id'])
+        self.assertEqual(added[1]['source'], 'Рабочее пространство')
+        with self.store._db() as database:
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM audit WHERE action='create' AND entity_type='products' AND entity_id IN (SELECT product_id FROM product_keys)").fetchone()[0], 3)
+
+    def test_more_than_200_imported_cards_cannot_mask_an_earlier_work_event(self):
+        task = self.store.save_task({'title': 'Задача до большого импорта'})
+        self.store.import_products([{'key': f'synthetic|large-{number}|шт', 'name': f'Импорт {number}',
+                                     'sku': f'BULK-{number}', 'unit': 'шт'} for number in range(205)])
+        visible = self.store.journal()
+        self.assertTrue(any(row['entity_id'] == task['id'] for row in visible))
+        self.assertEqual(sum(row['action'] == 'import' for row in visible), 1)
+        self.assertFalse(any(row['action'] == 'create' and row['entity_type'] == 'products'
+                             and row['description'].startswith('Импорт ') for row in visible))
+
+    def test_updates_of_imported_cards_remain_visible_as_workspace_events(self):
+        self.store.import_products([{'key': 'synthetic|edited|шт', 'name': 'Импортированная карточка',
+                                     'sku': 'EDITED-IMPORT', 'unit': 'шт'}])
+        product = next(row for row in self.store.list_entities('products') if row['sku'] == 'EDITED-IMPORT')
+        self.store.save_entity('products', {**product, 'name': 'Изменённая карточка'})
+        visible = [row for row in self.store.journal() if row['entity_id'] == product['id']]
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(visible[0]['action'], 'update')
+        self.assertEqual(visible[0]['source'], 'Рабочее пространство')
+
+    def test_journal_view_survives_reopen_without_modifying_raw_audit_or_products(self):
+        self.store.import_products([{'key': 'synthetic|durable|шт', 'name': 'Постоянная карточка',
+                                     'sku': 'DURABLE-IMPORT', 'unit': 'шт'}])
+        def raw_snapshot(store):
+            with store._db() as database:
+                return ([tuple(row) for row in database.execute('SELECT * FROM audit ORDER BY id')],
+                        [tuple(row) for row in database.execute('SELECT * FROM entities ORDER BY id')])
+        before = raw_snapshot(self.store)
+        visible = self.store.journal()
+        reopened = operation_fixtures.OperationsStore(self.path)
+        self.assertEqual(reopened.journal(), visible)
+        self.assertEqual(raw_snapshot(reopened), before)
+        self.assertGreater(len(before[0]), len(visible))
+
 
 if __name__ == '__main__':
     unittest.main()
