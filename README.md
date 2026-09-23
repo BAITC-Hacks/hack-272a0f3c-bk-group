@@ -1,125 +1,89 @@
-# hack-272a0f3c-bk-group
+# Помощник закупщика
 
-Hackathon team repository for BK-Group.
+Рабочий сценарий: ZIP с исходными Excel → паспорт качества → прогноз → проект закупки → карточка SKU → ручное уточнение входов → Excel/CSV. Данные остаются на компьютере; заказ поставщику автоматически не отправляется.
 
-## Project and current status
+## Запуск на этом компьютере
 
-HackAlem AI 2026, Logistics track. Partner: Elektrokomplekt / Электрокомплект (ekt.kz). Case: automatic calculation of supplier orders for warehouse replenishment.
+```powershell
+.\start.ps1
+```
 
-**Status as of 23 September 2026: initial requirements review and exploratory data analysis completed. The application, forecasting engine, and user interface are not implemented yet.** This commit documents actual analysis progress; it is not a finished solution. Analysis scripts have been run locally but are not included in this documentation-only commit. No installation or demo is available yet.
+Открыть **http://127.0.0.1:8765**. Исходные `IEK.zip` и `Systeme electric.zip` автоматически читаются из Downloads, если находятся там. В интерфейсе можно загрузить новые архивы. Первое чтение и классификация занимают несколько минут; повторный запуск использует локальный кэш по SHA-256 содержимого архивов и кода обработки. Изменение адаптеров, классификатора или расчётов автоматически обновляет кэш.
 
-## Business problem
+Другой порт и явные пути:
 
-Purchasing managers manually combine Excel reports to decide what to order, how much, and when. Recorded sales can understate demand during stockouts or overstate regular demand after exceptional bulk transactions. Existing stock, reservations, and incoming deliveries must also be considered to avoid both shortages and excess inventory.
+```powershell
+python app.py --port 8766 --archives "C:\data\IEK.zip" "C:\data\Systeme electric.zip"
+```
 
-## Mandatory case requirements
+Python 3.10+, зависимости в `requirements.txt`. На текущем компьютере `start.ps1` использует готовый Python Codex. Excel-экспорт использует Node.js и `@oai/artifact-tool`; в текущей среде подключён готовый пакет через `node_modules`. Если переносите проект, обеспечьте этот пакет и Node в PATH. CSV/ZIP не требует Node.
 
-1. Calculate replenishment by SKU using sales history, stock, incoming shipments, categories, and growth inputs.
-2. Account for seasonality and sustained demand growth.
-3. Estimate missed demand during stockouts.
-4. Identify exceptional large purchases, including customer-level patterns when anonymized customer identifiers are available.
-5. Group recommendations by supplier and explain each quantity.
+## Как получить проект заказа
 
-The intended workflow is calculation, manager review/edit, approval, and export. Orders must not be sent to suppliers without explicit employee approval. Minimum order quantities and order multiples are an optional enhancement supported by the supplied files.
+1. Дождаться загрузки на вкладке **План закупок**.
+2. На вкладке **Данные** проверить источники, пропуски, дубли и причины блокировки по SKU.
+3. На вкладке **Параметры** указать срок поставки, период пересмотра и квантиль страхового запаса. Подтвердить эти допущения только после проверки бизнес-смысла.
+4. Отдельно подтвердить единицы/кратность, полноту и даты поставок, смысл резервов. Пустые месяцы по умолчанию остаются неизвестными. Их можно считать нулём только явной настройкой.
+5. Открыть SKU. Просмотреть график, накладные, партии, источники и траекторию запаса. При необходимости внести текущий остаток, резерв, дату и кратность с причиной.
+6. Скачать Excel со всеми статусами или ZIP с проектами заказов отдельно по поставщикам. В проекты заказов входят только разблокированные строки с положительным количеством.
 
-## Sources inspected
+При первоначальном запуске все подтверждения выключены. Это ожидаемо: срок новой поставки и семантика исходных колонок не подтверждены самой выгрузкой. Для демонстрации можно включить их как явно оговорённые допущения; это не делает их фактами компании. Ручные данные сохраняются только для конкретного отпечатка исходных архивов.
 
-- [Official task brief](https://docs.google.com/document/d/1Z4faOPlT1t6NMCuJSKKB8-vkZ2LVzGMR0PO9rtZgSnM/edit)
-- [IEK archive](https://drive.google.com/file/d/18AqNcbkaqrvoLuX9fPsLMleEj7g6CWFb/view)
-- [Systeme Electric archive](https://drive.google.com/file/d/1CkzeElvVm_YwkFCofXX1MGBJuUjMecTz/view)
+## Реализовано
 
-Each archive contains six Excel workbooks: detailed sales, monthly sales, monthly inventory, seasonality, goods in transit, and minimum quantities/order multiples. The Systeme Electric transit report also includes categories, current stock, reservations, free stock, and growth factors.
+- Чтение двух реальных форматов архивов: накладные, месячные нетто-продажи, месячные начальные остатки, ограничения отгрузки, текущий срез Systeme Electric и товары в пути.
+- Каталог объединяет товары из накладных, месячных продаж, остатков, условий закупки и поставок. Единицы берутся только из явных колонок; неизвестные единицы блокируют заказ, конфликтующие требуют сверки. Товары без накладных остаются в каталоге и могут прогнозироваться по месячной истории.
+- Проверка покрытия, пропусков, многозначных единиц, дублей, свежести среза и согласованности свободного остатка.
+- Анализ накладная–SKU–единица: обычная партия, повторяющийся крупный объём, кандидат на разовый выброс. Повторяющиеся крупные партии остаются в спросе. Похожие накладные ищутся во всей истории SKU, включая соседние объёмы ниже порога.
+- После подтверждения условий минимальный порог аномалии учитывает упаковку и округлённую минимальную партию. Изменение упаковки/MOQ пересчитывает классификацию и устойчивый сценарий; неподтверждённые ограничения не используются.
+- Полный и устойчивый сценарии. Во втором ограничивается лишь превышение порога у кандидатов; только в месяцах, где накладные согласуются с месячным нетто-итогом.
+- Выбор метода по четырём прошлым контрольным месяцам: среднее, прошлогодний месяц или смесь недавнего уровня с ограниченным трендом и прошлогоднего месяца с ограниченным ростом. Коэффициенты ограничены диапазоном 0.5–1.5.
+- Расчёт ежедневной траектории на `lead time + review period`, с приходами в соответствующие даты. Заказ округляется по кратности и явно введённому минимальному количеству. Дефицит до новой поставки выделяется отдельно.
+- Страховой запас по квантилю недопрогноза на шести контрольных месяцах; малый объём проверки и приближённое масштабирование показаны пользователю.
+- Rolling-origin backtest трёх базовых прогнозов и выбора по прошлым ошибкам: среднее за 3 месяца, прошлогодний месяц, сезонность с трендом. WAPE, MAE, смещение — отдельно по единицам измерения.
+- Сценарная симуляция min/max, трёх базовых прогнозных политик и выбора по прошлым ошибкам на одинаковых начальных условиях. Результаты не обозначаются как реальная экономия или фактический stockout.
+- Интерфейс на русском, поиск, фильтры, карточка товара, графики, подтверждения и журнал SQLite.
+- Excel-снимок расчёта с параметрами и источниками; CSV/ZIP по поставщикам. Защита текстовых CSV-ячеек от исполнения формул.
 
-The two detailed reports contain 248,917 rows in total. Our initial filter retained 248,467 positive outgoing-invoice lines from 2025 and 2026, representing 80,933 distinct invoice documents. Negative movements, non-sales document types, and incomplete rows were excluded. These are gross positive quantities, not return-adjusted net demand. Historical correction rows also exist for earlier years.
+## Область применения и ограничения
 
-## Analysis method
+1. **Customer_id отсутствует.** Накладная — покупка, не человек. Клиентские профили, постоянные клиенты и связывание накладных не используются.
+2. **Импорт использует настроенные адаптеры Excel**, а не произвольный Excel. Новые структуры требуют адаптера. Импорт напрямую из 1С пока отсутствует.
+3. **Дата расчёта — дата среза архива**, не текущий день. Для нового дня нужен свежий срез.
+4. **Месячный начальный остаток не является текущим остатком.** IEK обычно потребует ручной свежий остаток и резерв. Отсутствующие поля не заменяются нулями.
+5. **Нет восстановления потерянных продаж.** Низкий начальный остаток — лишь сигнал проверки. Ежедневная реальная история stockout отсутствует.
+6. **Месячная сезонность рассчитана в количествах по SKU.** Денежные таблицы «Сезонность» перечислены в источниках, но не перемножаются автоматически со спросом в штуках или метрах.
+7. **Незакрытый месяц исключён из обучения.** Модель распределяет прогноз равномерно по календарным дням, без недельного календаря.
+8. **Прогноз использует месячные нетто-продажи**, возвраты в накладных показаны отдельно. Отрицательные месячные итоги сохраняются в истории, но ограничиваются нулём в прогнозе.
+9. **Резерв не должен дублировать прогноз.** В MVP используется политика дополнительного резерва, требующая явного подтверждения. Нет сопоставления резервов с датированными заказами.
+10. **Нет гарантии лучшей точности.** Показываются фактические ошибки всех методов. Устойчивый сценарий не прошёл отдельную историческую проверку; его нельзя рекламировать как доказанное улучшение.
+11. **Симуляция запасов условная:** срок и пересмотр по одному месяцу, общий начальный запас, нет фактических поступлений, резервов, упаковок и затрат. Это сравнение политик, не экономический эффект компании.
+12. **Ограничения на уровне компании.** Нет распределения по складам, оптимизации бюджета, подбора альтернативных поставщиков, логистических тарифов или интеграции с ERP.
+13. **Интерфейс предназначен для одного локального пользователя.** Публичное размещение требует полноценного веб-сервера, авторизации и защиты данных.
 
-Analysis used Python, pandas, NumPy, and openpyxl locally. These are analysis tools, not a committed application stack.
+## Проверки
 
-- Identify invoices by the full document field, and products by supplier, SKU, and unit.
-- Aggregate quantity per invoice/product before classification.
-- Never add metres, pieces, and packages together.
-- For each product with sufficient observations, flag a large line when quantity exceeds both three times the median and Q3 + 3 * IQR, where IQR = Q3 - Q1.
-- An invoice is flagged if at least one assessed product line is large. This is a heuristic for unusual size, not proof of a one-off customer order.
-- Missing customer IDs mean repeat customers cannot be identified.
+```powershell
+python -m unittest discover -s tests -v
+python -m unittest discover -s analysis -p "test_*.py" -v
+```
 
-### Initial exploration: all available 2025-2026 transactions
+Проверяются: отсутствие утечки будущего, исключение незакрытого месяца, неизвестный остаток, пропуски, блокировки, дата поставки, ранний дефицит, округление, журнал, экспорт только разрешённых строк и привязка корректировок к источнику. Синтетические тестовые SKU используются только в тестах; вымышленных клиентов нет.
 
-Using separate product/year thresholds and at least 20 observations per product/year:
+## Структура
 
-| Classification | Invoices | Share |
-| --- | ---: | ---: |
-| At least one unusually large line | 6,674 | 8.25% |
-| No flagged lines; all included lines assessable | 62,335 | 77.02% |
-| No flagged lines, but incomplete history for some products | 11,924 | 14.73% |
-| Total | 80,933 | 100% |
+- `app.py`, `web/index.html` — локальный сервер и интерфейс.
+- `procurement/data.py` — адаптеры Excel.
+- `procurement/forecast.py` — прогноз, backtest и сценарная симуляция.
+- `procurement/engine.py` — паспорт входов, блокировки, расчёт заказа.
+- `procurement/storage.py` — параметры и журнал, без базы покупателей.
+- `procurement/export.py`, `scripts/export_xlsx.mjs` — выгрузки.
+- `data/` — локальный кэш и журнал; исключены из Git.
 
-Flagged product lines account for 58.02% of positive quantities measured in pieces, 34.84% in metres, and 32.04% in packages. These are physical-volume shares, not revenue shares. An absence of flags does not prove that purchases are regular.
+`analysis/customer_profile.py` — изолированное старое расширение для будущей реальной колонки ID. Приложение его не импортирует. Названия «Покупатель» и «Контрагент» больше не принимаются автоматически за стабильные ID.
 
-### Comparable year-over-year analysis
+## Проверки после ревью
 
-To avoid comparing a full year with an incomplete year, we compared 1 January through 22 September in both 2025 and 2026. We retained 680 supplier/SKU/unit combinations with at least 20 observations in EACH year and used one pooled threshold per product across both periods.
+Регрессии в `tests/test_review_fixes.py` покрывают полноту каталога и единицы, работу без накладных, повторяемость партий около порога, упаковку и минимальную партию, пересчёт после ручных уточнений, а также инвалидирование обоих кэшей при изменении адаптера или зависимостей из `analysis`.
 
-| Metric | 2025 | 2026 |
-| --- | ---: | ---: |
-| Invoices containing the retained products | 29,169 | 30,401 |
-| Invoices with a flagged line among retained products | 2,762 | 2,492 |
-| Flagged share of those invoices | 9.47% | 8.20% |
-
-These percentages have a different period, product population, and threshold basis from the initial exploration above.
-
-Key findings:
-
-- 460 of the 506 products with large purchases in 2026 also had large purchases in 2025: 90.91% of products, not customers.
-- 157 products had at least five large purchases in EACH comparison period.
-- Repeated large quantities often resemble standard batch sizes. They must not automatically be removed as exceptional demand.
-
-| Product | Median purchase, 2025 / 2026 | Large purchases, 2025 / 2026 | Repeated batch sizes |
-| --- | --- | --- | --- |
-| IEK VA47-29 16A, SKU 010500006_ | 12 / 12 pieces | 376 / 438 | 144, 288, 432 |
-| IEK VA47-29 25A, SKU 010500008_ | 12 / 12 pieces | 235 / 297 | 144, 288, 720 |
-| Systeme IMT35100, SKU 030200192_ | 50 / 49 pieces | 172 / 174 | 800, 1,000, 2,000 |
-
-For the 16A breaker, exactly 144 pieces were purchased 225 times in the 2025 comparison period and 247 times in 2026. Large purchases occurred in all nine observed months of both years.
-
-Monthly pattern comparisons used only complete January-August months. Aggregate piece volumes for the retained IEK products show similar summer increases across the two years (Pearson correlation approximately 0.80); Systeme Electric is less similar (approximately 0.37). At individual product level, only 5.58% of 663 eligible series had correlation at least 0.70; the median correlation was approximately zero. Two years and eight paired months do not establish reliable seasonality for every SKU. Stock availability and exceptional transactions may confound these patterns.
-
-## Actual inventory example: IMT35150
-
-Source: Systeme Electric workbook "Товар в пути_SystemElectric на 22.09.2026.xlsx", sheet TDSheet, Excel row 484. This is the supplier-report snapshot, not a live inventory check.
-
-| Reported sales | 2025 | 2026 |
-| --- | ---: | ---: |
-| July | 23,583 | 39,200 |
-| August | 22,269 | 36,290 |
-| Two-month total | 45,852 | 75,490 |
-
-The report shows a 64.64% increase over these matching summer months. As of the report date:
-
-- Stock: 43,539 pieces.
-- Reserved: 4,008 pieces.
-- Free stock: 39,531 pieces.
-- Incoming quantity in the column labelled "СЭ в пути 24.09": 37,800 pieces.
-
-At the simple July-August 2026 average of 37,745 pieces/month, free stock represents about 1.05 months. If the indicated delivery arrives fully and on time, free stock plus incoming quantity would be 77,331 pieces, about 2.05 months at that same rate. These are illustrative coverage calculations, not a demand forecast or a purchase recommendation.
-
-## Data issues and unresolved questions
-
-1. **Reports do not reconcile.** For IMT35150 in August 2025, the transit summary reports 22,269 pieces, the separate monthly-sales workbook reports 22,259, and positive detailed outgoing invoices total 31,776. Report scope, adjustment rules, and cut-off dates need confirmation. We have not established the cause and do not silently merge these totals.
-2. **No anonymized customer ID** exists in either detailed sales report, although the brief anticipates it. Repeated batch sizes do not identify recurring customers.
-3. **Monthly inventory snapshots are not stockout intervals.** They cannot establish exact days unavailable or missed sales. Missing cells must not automatically be treated as zero stock.
-4. **Not all negatives are explained.** Returns/corrections require document-level interpretation before constructing net demand.
-5. **Units and purchasing multiples matter.** Some IEK products are purchased in rolls but stocked in metres. Conversions must be explicit.
-6. **September 2026 is incomplete.** Full-month historical comparisons and partial-month observations must remain distinct.
-7. **Large does not mean exceptional.** Repeated wholesale-sized transactions should be distinguished from genuinely isolated events before any filtering.
-
-## Planned next implementation steps
-
-- Confirm source definitions and reconcile overlapping reports.
-- Build validated imports with explicit SKU/unit mappings and data-quality warnings.
-- Implement a transparent baseline forecast, growth/seasonality handling, and stockout adjustments where supported.
-- Separate recurring large-batch demand from candidate one-off spikes; test missing scenarios with clearly labelled synthetic data if necessary.
-- Calculate supplier-grouped recommendations using available stock, reservations, incoming deliveries, lead times, and order multiples.
-- Add manager review, explanations, export, reproducible tests, and verified installation instructions.
-
-These are planned features, not claims of completed implementation. No confidential customer identities, credentials, or raw data archives are included in this commit.
+Интерфейс использует нейтральные названия процессов, а список поставщиков формируется из загруженных данных. Это не расширяет автоматически набор Excel-адаптеров: текущие схемы описаны выше. Ограничение идентификации покупателей относится к модели данных и документации, а не к подсказкам закупщику.

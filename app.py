@@ -1,0 +1,306 @@
+"""Run `python app.py`; local-only web UI, no external services."""
+import argparse
+import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import threading
+import traceback
+from urllib.parse import urlparse, parse_qs
+import uuid
+import hashlib
+import pickle
+import math
+
+import pandas as pd
+
+from procurement.data import load_archives
+from procurement.engine import build_report, prepare_lines, validate_settings, DEFAULTS
+from procurement.export import export_zip, export_xlsx
+from procurement.storage import Store
+
+ROOT=Path(__file__).resolve().parent
+
+
+def pipeline_fingerprint(root=ROOT):
+    """Invalidate every derived cache when a processing dependency changes."""
+    digest = hashlib.sha256(b'procurement-pipeline-v3')
+    paths = [root/'app.py', *sorted((root/'procurement').glob('*.py')),
+             *sorted((root/'analysis').glob('*.py'))]
+    for path in paths:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def source_fingerprint(paths):
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(Path(path).read_bytes())
+    return digest.hexdigest()
+
+
+def normalized_cache_path(state_dir, signature):
+    return Path(state_dir)/f'normalized-{signature}-{pipeline_fingerprint()}.pkl'
+
+
+def json_default(value):
+    if isinstance(value,pd.Timestamp):
+        return value.isoformat() if pd.notna(value) else None
+    if hasattr(value,'item'):
+        return value.item()
+    raise TypeError(str(type(value)))
+
+
+def encode(value):
+    def clean(item):
+        if item is pd.NaT:
+            return None
+        if isinstance(item,dict):
+            return {key:clean(val) for key,val in item.items()}
+        if isinstance(item,(list,tuple)):
+            return [clean(val) for val in item]
+        if isinstance(item,float) and not math.isfinite(item):
+            return None
+        if isinstance(item,pd.Timestamp):
+            return item.isoformat()
+        if hasattr(item,'item'):
+            return clean(item.item())
+        return item
+    return json.dumps(clean(value),ensure_ascii=False,allow_nan=False).encode('utf-8')
+
+
+def settings_for_dataset(store,fingerprint):
+    settings=store.get('settings',DEFAULTS).copy()
+    if store.get('settings_dataset',None)!=fingerprint:
+        for key,value in DEFAULTS.items():
+            if isinstance(value,bool):
+                settings[key]=False
+    return settings
+
+
+class Application:
+    def __init__(self,paths,state_dir):
+        self.paths=paths
+        self.state_dir=Path(state_dir)
+        self.store=Store(self.state_dir/'journal.sqlite3')
+        self.data=None
+        self.lines=None
+        self.report=None
+        self.busy=False
+        self.message='Ожидание загрузки'
+        self.error=None
+        self.lock=threading.Lock()
+
+    def submit(self,operation):
+        with self.lock:
+            if self.busy:
+                raise ValueError('Расчет уже выполняется')
+            self.busy=True
+            self.error=None
+        def run():
+            try:
+                operation()
+                self.message='Готово'
+            except Exception as exc:
+                self.error=str(exc)
+                self.message='Расчет не завершен'
+                traceback.print_exc()
+            finally:
+                self.busy=False
+        threading.Thread(target=run,daemon=True).start()
+
+    def load(self,paths):
+        signature=source_fingerprint(paths)
+        cache=normalized_cache_path(self.state_dir,signature)
+        if cache.exists():
+            # Private local cache written here; uploaded files are never unpickled.
+            with cache.open('rb') as handle:
+                dataset,lines=pickle.load(handle)
+        else:
+            self.message='Читаем продажи, остатки, ограничения и поставки из всех книг…'
+            dataset=load_archives(paths)
+            self.message='Подготавливаем историю продаж и объёмы партий…'
+            lines=prepare_lines(dataset)
+            with cache.open('wb') as handle:
+                pickle.dump((dataset,lines),handle)
+        self.message='Рассчитываем прогноз, backtest и план закупок…'
+        settings=settings_for_dataset(self.store,dataset.fingerprint)
+        overrides=self.store.get('overrides',{})
+        report_cache=self.report_cache_path(dataset,settings,overrides)
+        if report_cache.exists():
+            with report_cache.open('rb') as handle:
+                report=pickle.load(handle)
+        else:
+            report=build_report(dataset,lines,settings,overrides,self.progress)
+            with report_cache.open('wb') as handle:
+                pickle.dump(report,handle)
+        self.data,self.lines,self.report=dataset,lines,report
+        self.paths=paths
+
+    def report_cache_path(self,dataset,settings,overrides):
+        digest=hashlib.sha256(dataset.fingerprint.encode())
+        digest.update(json.dumps([settings,overrides],sort_keys=True).encode())
+        digest.update(pipeline_fingerprint().encode())
+        return self.state_dir/('report-'+digest.hexdigest()+'.pkl')
+
+    def calculate(self,settings,overrides=None):
+        if self.data is None:
+            raise ValueError('Сначала загрузите архивы')
+        self.message='Пересчитываем рекомендации и историческую проверку…'
+        report=build_report(self.data,self.lines,settings,overrides if overrides is not None else self.store.get('overrides',{}),self.progress)
+        self.report=report
+        self.store.put('settings',settings,'Расчет с параметрами')
+        self.store.put('settings_dataset',self.data.fingerprint,'Источник подтвержденных параметров')
+        if overrides is not None:
+            self.store.put('overrides',overrides,'Ручная корректировка входных данных')
+
+    def progress(self,message):
+        self.message=message
+
+    def override(self,request):
+        if self.report is None:
+            raise ValueError('Расчет еще не готов')
+        key=request['key']
+        if key not in {p['key'] for p in self.report['rows']}:
+            raise ValueError('Неизвестный SKU')
+        reason=str(request.get('reason','')).strip()
+        if len(reason)<5:
+            raise ValueError('Укажите источник или причину корректировки (от 5 символов)')
+        record={'reason':reason,'dataset':self.data.fingerprint}
+        for field in ('on_hand','reserved','pack_multiple','minimum_order_quantity'):
+            value=request.get(field)
+            if value not in (None,''):
+                value=float(value)
+                if not 0<=value<=1e12 or (field=='pack_multiple' and value==0):
+                    raise ValueError('Некорректное значение '+field)
+                record[field]=value
+        if ('on_hand' in record) != ('reserved' in record):
+            raise ValueError('Остаток и резерв указываются вместе; нулевой резерв вводится явно')
+        if 'on_hand' in record:
+            record['snapshot_date']=str(pd.Timestamp(request['snapshot_date']).date())
+        overrides=self.store.get('overrides',{})
+        overrides[key]=record
+        self.submit(lambda:self.calculate(self.report['settings'],overrides))
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,format,*args):
+        if args and str(args[1] if len(args)>1 else '').startswith('5'):
+            super().log_message(format,*args)
+
+    def send(self,data,kind='application/json; charset=utf-8',code=200,filename=None):
+        self.send_response(code)
+        self.send_header('Content-Type',kind)
+        self.send_header('Content-Length',str(len(data)))
+        self.send_header('Cache-Control','no-store')
+        self.send_header('X-Content-Type-Options','nosniff')
+        if filename:
+            self.send_header('Content-Disposition',f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def local_request(self):
+        host=self.headers.get('Host','').split(':')[0]
+        if host not in ('localhost','127.0.0.1'):
+            raise ValueError('Разрешено только локальное подключение')
+        origin=self.headers.get('Origin')
+        if origin and urlparse(origin).netloc!=self.headers.get('Host'):
+            raise ValueError('Запрос из другого источника запрещен')
+
+    def do_GET(self):
+        try:
+            self.local_request()
+            app=self.server.application
+            url=urlparse(self.path)
+            if url.path=='/':
+                self.send((ROOT/'web/index.html').read_bytes(),'text/html; charset=utf-8')
+            elif url.path=='/api/status':
+                self.send(encode({'busy':app.busy,'message':app.message,'error':app.error,'loaded':app.report is not None}))
+            elif url.path=='/api/report':
+                if app.report is None:
+                    raise ValueError('Данные еще не загружены')
+                excluded={'history','examples','shipments','backtest','sources','override'}
+                rows=[{k:v for k,v in r.items() if k not in excluded and k!='calculation'} |
+                    {'order_date':(r['calculation'] or {}).get('order_date') if r['ready'] else None} for r in app.report['rows']]
+                self.send(encode({**app.report,'rows':rows}))
+            elif url.path=='/api/product':
+                key=parse_qs(url.query).get('key',[''])[0]
+                product=next((r for r in app.report['rows'] if r['key']==key),None)
+                if product is None:
+                    raise ValueError('SKU не найден')
+                self.send(encode(product))
+            elif url.path=='/api/journal':
+                self.send(encode(app.store.history()))
+            elif url.path in ('/api/export.zip','/api/export.xlsx'):
+                if app.report is None or app.busy:
+                    raise ValueError('Дождитесь завершения расчета')
+                if url.path.endswith('.zip'):
+                    self.send(export_zip(app.report),'application/zip',filename='purchase-plan.zip')
+                else:
+                    self.send(export_xlsx(app.report),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',filename='purchase-plan.xlsx')
+            else:
+                self.send(encode({'error':'Не найдено'}),code=404)
+        except Exception as exc:
+            self.send(encode({'error':str(exc)}),code=400)
+
+    def do_POST(self):
+        try:
+            self.local_request()
+            length=int(self.headers.get('Content-Length','0'))
+            if not 0<length<=50_000_000:
+                raise ValueError('Запрос слишком большой или пустой')
+            request=json.loads(self.rfile.read(length))
+            app=self.server.application
+            if self.path=='/api/calculate':
+                settings=validate_settings(request)
+                app.submit(lambda:app.calculate(settings))
+            elif self.path=='/api/override':
+                app.override(request)
+            elif self.path=='/api/load-default':
+                paths=default_paths()
+                if not paths:
+                    raise ValueError('Архивы в Downloads не найдены. Загрузите их через интерфейс.')
+                app.submit(lambda:app.load(paths))
+            elif self.path=='/api/upload':
+                files=request.get('files',[])
+                if not 1<=len(files)<=2:
+                    raise ValueError('Загрузите один или два ZIP-архива')
+                folder=app.state_dir/'uploads'/uuid.uuid4().hex
+                folder.mkdir(parents=True)
+                paths=[]
+                for index,file in enumerate(files):
+                    # Client names never become filesystem paths.
+                    path=folder/f'archive-{index}.zip'
+                    path.write_bytes(base64.b64decode(file['content'],validate=True))
+                    paths.append(path)
+                app.submit(lambda:app.load(paths))
+            else:
+                raise ValueError('Неизвестное действие')
+            self.send(encode({'ok':True}),code=202)
+        except Exception as exc:
+            self.send(encode({'error':str(exc)}),code=400)
+
+
+def default_paths():
+    return [p for p in (Path.home()/'Downloads'/'IEK.zip',Path.home()/'Downloads'/'Systeme electric.zip') if p.exists()]
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--archives',nargs='*')
+    parser.add_argument('--state-dir',default=str(ROOT/'data'))
+    args=parser.parse_args()
+    paths=[Path(p) for p in args.archives] if args.archives else default_paths()
+    application=Application(paths,args.state_dir)
+    server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
+    server.application=application
+    if paths:
+        application.submit(lambda:application.load(paths))
+    print(f'Procurement MVP: http://127.0.0.1:{args.port}',flush=True)
+    server.serve_forever()
+
+
+if __name__=='__main__':
+    main()

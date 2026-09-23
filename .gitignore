@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+outputs/
+node_modules/
+.venv/
+analysis/orders_cache.pkl
