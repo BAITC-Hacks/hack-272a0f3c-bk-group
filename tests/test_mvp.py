@@ -9,7 +9,7 @@ import pandas as pd
 
 from procurement.data import Dataset, month_date
 from procurement.engine import build_report, plan_inventory, validate_settings
-from procurement.forecast import predict, backtest, future_daily, simulate_policies
+from procurement.forecast import predict, backtest, future_daily, simulate_policies, METHODS
 from procurement.export import export_zip, safe_cell
 from procurement.storage import Store
 from app import encode, settings_for_dataset
@@ -33,7 +33,7 @@ class ForecastTests(unittest.TestCase):
         history=pd.Series(10.,index=pd.date_range('2024-01-01',periods=24,freq='MS'))
         history.iloc[-1]=np.nan
         records=backtest(history)
-        self.assertEqual(len(records),20)
+        self.assertEqual(len(records),5 * len(METHODS))
         self.assertTrue(all(r['forecast']==10 for r in records))
 
     def test_late_receipt_does_not_hide_early_shortage(self):
@@ -56,7 +56,7 @@ class ForecastTests(unittest.TestCase):
     def test_simulation_excludes_unknown_actuals_and_has_comparable_policies(self):
         history=pd.Series(30.,index=pd.date_range('2024-01-01',periods=24,freq='MS'))
         results=simulate_policies(history)
-        self.assertEqual({r['method'] for r in results},{'minmax','mean3','seasonal_naive','adaptive','selected'})
+        self.assertEqual({r['method'] for r in results},{'minmax', *METHODS})
         self.assertTrue(all(r['demand']==180 and r['lost']==0 for r in results))
         history.iloc[-1]=np.nan
         self.assertEqual(simulate_policies(history),[])
@@ -103,6 +103,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertGreater(row['quantity'],0)
         self.assertEqual(row['quantity']%6,0)
         self.assertEqual(row['sources']['snapshot'],'snapshot')
+        self.assertTrue(row['forecast_selection']['reason'])
+        self.assertEqual([r['month'] for r in row['forecast_schedule']],['2026-09','2026-10','2026-11'])
 
     def test_missing_stock_never_becomes_zero(self):
         data,lines=fixture()

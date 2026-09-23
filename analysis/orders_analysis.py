@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from analysis.procurement_logic import round_purchase_quantity
+
 
 DATA_PATH = Path(__file__).with_name("orders_cache.pkl")
 PROFILE_KEYS = ["supplier", "sku", "Ед."]
@@ -15,21 +17,27 @@ MIN_REPEATED_MONTHS = 2
 
 
 def build_invoice_lines(data):
+    quantities = pd.to_numeric(data["Количество"], errors='coerce')
     valid = (
         data["Документ"].astype(str).str.startswith("Расходная накладная ")
         & data["date"].notna()
-        & data["Количество"].gt(0)
+        & quantities.gt(0)
+        & np.isfinite(quantities)
         & data["Код"].notna()
+        & data["Код"].astype(str).str.strip().ne('')
         & data["Ед."].notna()
-        & data["Ед."].ne('')
+        & data["Ед."].astype(str).str.strip().ne('')
     )
     sales = data.loc[valid].copy()
+    sales['Количество'] = quantities.loc[valid]
     sales["year"] = sales["date"].dt.year
     sales["invoice"] = sales["Документ"].astype(str).str.strip()
     sales["sku"] = sales["Код"].astype(str).str.strip()
+    sales['Ед.'] = sales['Ед.'].astype(str).str.strip()
+    sales['invoice_day'] = sales['date'].dt.normalize()
 
     lines = sales.groupby(
-        PROFILE_KEYS + ["year", "invoice"], as_index=False
+        PROFILE_KEYS + ["year", "invoice", "invoice_day"], as_index=False
     ).agg(
         qty=("Количество", "sum"),
         date=("date", "min"),
@@ -68,7 +76,8 @@ def classify_invoice_line_patterns(lines, batch_rules=None):
         rule = rules.get(key, {})
         pack = rule.get('pack_multiple', 0) or 0
         minimum = rule.get('minimum_order_quantity', 0) or 0
-        floors.append(max(pack, np.ceil(minimum / pack) * pack if pack else minimum))
+        floors.append(round_purchase_quantity(max(pack, minimum),
+            pack_multiple=pack or None, minimum_order_quantity=minimum))
     result['batch_floor'] = floors
     result['threshold'] = np.maximum(result.statistical_threshold, result.batch_floor)
     result['large'] = result['eligible'] & result.qty.gt(result.threshold)
@@ -148,9 +157,11 @@ def explain_pattern(row):
 
 
 def summarize(group):
-    # Invoice numbers can repeat in exports from different suppliers, so the
-    # purchase key is the source supplier plus the invoice number.
-    invoices = group.groupby(["supplier", "invoice"]).agg(
+    # Document numbers can restart each year or be reused on distinct dates.
+    invoice_keys = ["supplier", "year", "invoice"]
+    if 'invoice_day' in group:
+        invoice_keys.append('invoice_day')
+    invoices = group.groupby(invoice_keys).agg(
         has_repeating_wholesale=(
             "pattern_class",
             lambda values: values.eq("repeating_wholesale_batch").any(),

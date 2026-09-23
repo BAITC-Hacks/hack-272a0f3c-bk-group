@@ -1,4 +1,4 @@
-"""Run `python app.py`; local-only web UI, no external services."""
+"""Run `python app.py`; local UI with optional cloud AI assistant."""
 import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,13 +11,18 @@ import uuid
 import hashlib
 import pickle
 import math
+import csv
+from datetime import date
 
 import pandas as pd
 
-from procurement.data import load_archives
+from procurement.data import load_archives, Dataset
 from procurement.engine import build_report, prepare_lines, validate_settings, DEFAULTS
 from procurement.export import export_zip, export_xlsx
 from procurement.storage import Store
+from procurement.history import run_history, validate_period
+from procurement.assistant import answer as assistant_answer, configuration as assistant_configuration
+from operations import OperationsStore
 
 ROOT=Path(__file__).resolve().parent
 
@@ -42,6 +47,30 @@ def source_fingerprint(paths):
 
 def normalized_cache_path(state_dir, signature):
     return Path(state_dir)/f'normalized-{signature}-{pipeline_fingerprint()}.pkl'
+
+
+def read_cache(path):
+    """A interrupted private cache write must not make original files unusable."""
+    try:
+        with Path(path).open('rb') as handle:
+            return pickle.load(handle)
+    except (OSError, EOFError, pickle.UnpicklingError, ValueError, TypeError, AttributeError, ImportError):
+        return None
+
+
+def write_atomic(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def reject_json_constant(value):
+    raise ValueError('Недопустимое числовое значение JSON')
 
 
 def json_default(value):
@@ -80,24 +109,43 @@ def settings_for_dataset(store,fingerprint):
 
 
 class Application:
-    def __init__(self,paths,state_dir):
+    def __init__(self,paths,state_dir,history_output_dir=None):
         self.paths=paths
         self.state_dir=Path(state_dir)
+        self.history_output_dir=Path(history_output_dir) if history_output_dir is not None else ROOT/'outputs'/'historical'
         self.store=Store(self.state_dir/'journal.sqlite3')
+        self.operations=OperationsStore(self.state_dir/'operations.sqlite3')
         self.data=None
         self.lines=None
         self.report=None
+        self.history_report=None
+        self.instance_id=uuid.uuid4().hex
+        self.report_revision=0
+        self.history_revision=0
         self.busy=False
         self.message='Ожидание загрузки'
         self.error=None
         self.lock=threading.Lock()
 
-    def submit(self,operation):
+    def request_revision(self,request):
+        if self.report is None:
+            raise ValueError('Сначала загрузите данные')
+        if ('expected_report_revision' not in request or 'expected_dataset' not in request
+                or 'expected_instance_id' not in request
+                or type(request['expected_report_revision']) is not int):
+            raise ValueError('Расчёт изменился. Обновите данные и повторите действие.')
+        return request['expected_report_revision'],request['expected_dataset'],request['expected_instance_id']
+
+    def submit(self,operation,expected=None):
         with self.lock:
             if self.busy:
                 raise ValueError('Расчет уже выполняется')
+            if expected is not None and (self.data is None
+                    or expected != (self.report_revision,self.data.fingerprint,self.instance_id)):
+                raise ValueError('Расчёт изменился. Обновите данные и повторите действие.')
             self.busy=True
             self.error=None
+            self.message='Выполняется операция…'
         def run():
             try:
                 operation()
@@ -107,36 +155,39 @@ class Application:
                 self.message='Расчет не завершен'
                 traceback.print_exc()
             finally:
-                self.busy=False
+                with self.lock:
+                    self.busy=False
         threading.Thread(target=run,daemon=True).start()
 
     def load(self,paths):
         signature=source_fingerprint(paths)
         cache=normalized_cache_path(self.state_dir,signature)
-        if cache.exists():
-            # Private local cache written here; uploaded files are never unpickled.
-            with cache.open('rb') as handle:
-                dataset,lines=pickle.load(handle)
+        # Only private cache files are unpickled, never uploaded archives.
+        cached = read_cache(cache)
+        if (isinstance(cached, tuple) and len(cached) == 2 and isinstance(cached[0], Dataset)
+                and cached[0].fingerprint == signature and isinstance(cached[1], pd.DataFrame)):
+            dataset,lines=cached
         else:
             self.message='Читаем продажи, остатки, ограничения и поставки из всех книг…'
             dataset=load_archives(paths)
             self.message='Подготавливаем историю продаж и объёмы партий…'
             lines=prepare_lines(dataset)
-            with cache.open('wb') as handle:
-                pickle.dump((dataset,lines),handle)
+            write_atomic(cache,pickle.dumps((dataset,lines)))
         self.message='Рассчитываем прогноз, backtest и план закупок…'
         settings=settings_for_dataset(self.store,dataset.fingerprint)
         overrides=self.store.get('overrides',{})
         report_cache=self.report_cache_path(dataset,settings,overrides)
-        if report_cache.exists():
-            with report_cache.open('rb') as handle:
-                report=pickle.load(handle)
-        else:
+        report = read_cache(report_cache)
+        if not (isinstance(report,dict) and report.get('dataset')==signature
+                and isinstance(report.get('rows'),list) and 'settings' in report and 'metrics' in report):
             report=build_report(dataset,lines,settings,overrides,self.progress)
-            with report_cache.open('wb') as handle:
-                pickle.dump(report,handle)
-        self.data,self.lines,self.report=dataset,lines,report
-        self.paths=paths
+            write_atomic(report_cache,pickle.dumps(report))
+        with self.lock:
+            self.data,self.lines,self.report=dataset,lines,report
+            self.history_report=None
+            self.paths=paths
+            self.report_revision+=1
+            self.history_revision+=1
 
     def report_cache_path(self,dataset,settings,overrides):
         digest=hashlib.sha256(dataset.fingerprint.encode())
@@ -149,39 +200,104 @@ class Application:
             raise ValueError('Сначала загрузите архивы')
         self.message='Пересчитываем рекомендации и историческую проверку…'
         report=build_report(self.data,self.lines,settings,overrides if overrides is not None else self.store.get('overrides',{}),self.progress)
-        self.report=report
-        self.store.put('settings',settings,'Расчет с параметрами')
-        self.store.put('settings_dataset',self.data.fingerprint,'Источник подтвержденных параметров')
+        records=[('settings',settings,'Расчет с параметрами'),
+                 ('settings_dataset',self.data.fingerprint,'Источник подтвержденных параметров')]
         if overrides is not None:
-            self.store.put('overrides',overrides,'Ручная корректировка входных данных')
+            records.append(('overrides',overrides,'Ручная корректировка входных данных'))
+        self.store.put_many(records)
+        with self.lock:
+            self.report=report
+            self.report_revision+=1
 
     def progress(self,message):
         self.message=message
 
-    def override(self,request):
+    def evaluate_period(self,start,end):
+        report, observations = run_history(self.data,start,end,self.progress)
+        folder = self.history_output_dir
+        folder.mkdir(parents=True,exist_ok=True)
+        import io
+        with io.StringIO(newline='') as handle:
+            from procurement.export import safe_cell
+            writer = csv.DictWriter(handle,fieldnames=list(observations[0]),delimiter=';')
+            writer.writeheader()
+            writer.writerows({key:safe_cell(value) for key,value in row.items()} for row in observations)
+            write_atomic(folder/'forecasts.csv',handle.getvalue().encode('utf-8-sig'))
+        write_atomic(folder/'report.json',encode(report))
+        with self.lock:
+            self.history_report=report
+            self.history_revision+=1
+
+    def upload(self, request):
+        files=request.get('files')
+        if not isinstance(files,list) or not 1<=len(files)<=2:
+            raise ValueError('Загрузите один или два ZIP-архива')
+        contents=[]
+        for file in files:
+            if not isinstance(file,dict) or not isinstance(file.get('content'),str):
+                raise ValueError('Некорректное содержимое архива')
+            try:
+                raw=base64.b64decode(file['content'],validate=True)
+            except (ValueError,TypeError):
+                raise ValueError('Повреждённая передача архива: повторите загрузку') from None
+            if not raw:
+                raise ValueError('Пустой архив')
+            contents.append(raw)
+        def load_upload():
+            folder=self.state_dir/'uploads'/uuid.uuid4().hex
+            folder.mkdir(parents=True)
+            paths=[]
+            for index,content in enumerate(contents):
+                # Client-supplied names never become filesystem paths.
+                path=folder/f'archive-{index}.zip'
+                write_atomic(path,content)
+                paths.append(path)
+            self.load(paths)
+        self.submit(load_upload)
+
+    def override(self,request,expected=None):
         if self.report is None:
             raise ValueError('Расчет еще не готов')
         key=request['key']
         if key not in {p['key'] for p in self.report['rows']}:
             raise ValueError('Неизвестный SKU')
-        reason=str(request.get('reason','')).strip()
-        if len(reason)<5:
-            raise ValueError('Укажите источник или причину корректировки (от 5 символов)')
-        record={'reason':reason,'dataset':self.data.fingerprint}
+        reason=request.get('reason','')
+        if not isinstance(reason,str) or not 5<=len(reason.strip())<=2000:
+            raise ValueError('Укажите источник или причину корректировки (от 5 до 2000 символов)')
+        overrides=self.store.get('overrides',{})
+        previous=overrides.get(key,{})
+        record=previous.copy() if previous.get('dataset')==self.data.fingerprint else {}
+        record.update(reason=reason.strip(),dataset=self.data.fingerprint)
         for field in ('on_hand','reserved','pack_multiple','minimum_order_quantity'):
+            if field not in request:
+                continue
             value=request.get(field)
             if value not in (None,''):
-                value=float(value)
+                if isinstance(value,bool):
+                    raise ValueError('Некорректное значение '+field)
+                try:
+                    value=float(value)
+                except (ValueError,TypeError):
+                    raise ValueError('Некорректное значение '+field) from None
                 if not 0<=value<=1e12 or (field=='pack_multiple' and value==0):
                     raise ValueError('Некорректное значение '+field)
                 record[field]=value
+            else:
+                record.pop(field,None)
         if ('on_hand' in record) != ('reserved' in record):
             raise ValueError('Остаток и резерв указываются вместе; нулевой резерв вводится явно')
         if 'on_hand' in record:
-            record['snapshot_date']=str(pd.Timestamp(request['snapshot_date']).date())
-        overrides=self.store.get('overrides',{})
+            stamp=request.get('snapshot_date',record.get('snapshot_date'))
+            try:
+                if not isinstance(stamp,str) or date.fromisoformat(stamp).isoformat()!=stamp:
+                    raise ValueError()
+            except ValueError:
+                raise ValueError('Дата среза должна иметь формат ГГГГ-ММ-ДД') from None
+            record['snapshot_date']=stamp
+        else:
+            record.pop('snapshot_date',None)
         overrides[key]=record
-        self.submit(lambda:self.calculate(self.report['settings'],overrides))
+        self.submit(lambda:self.calculate(self.report['settings'],overrides),expected=expected)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -190,15 +306,19 @@ class Handler(BaseHTTPRequestHandler):
             super().log_message(format,*args)
 
     def send(self,data,kind='application/json; charset=utf-8',code=200,filename=None):
-        self.send_response(code)
-        self.send_header('Content-Type',kind)
-        self.send_header('Content-Length',str(len(data)))
-        self.send_header('Cache-Control','no-store')
-        self.send_header('X-Content-Type-Options','nosniff')
-        if filename:
-            self.send_header('Content-Disposition',f'attachment; filename="{filename}"')
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type',kind)
+            self.send_header('Content-Length',str(len(data)))
+            self.send_header('Cache-Control','no-store')
+            self.send_header('X-Content-Type-Options','nosniff')
+            if filename:
+                self.send_header('Content-Disposition',f'attachment; filename="{filename}"')
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError,ConnectionResetError,ConnectionAbortedError):
+            # Closing a tab cancels its request; never attempt a second response.
+            self.close_connection=True
 
     def local_request(self):
         host=self.headers.get('Host','').split(':')[0]
@@ -215,23 +335,58 @@ class Handler(BaseHTTPRequestHandler):
             url=urlparse(self.path)
             if url.path=='/':
                 self.send((ROOT/'web/index.html').read_bytes(),'text/html; charset=utf-8')
+            elif url.path in ('/assistant.js', '/assistant.css', '/operations.js', '/operations.css'):
+                self.send((ROOT/'web'/url.path[1:]).read_bytes(),
+                          'text/javascript; charset=utf-8' if url.path.endswith('.js') else 'text/css; charset=utf-8')
+            elif url.path=='/api/assistant/config':
+                self.send(encode({'providers':assistant_configuration()}))
+            elif url.path.startswith('/api/operations/'):
+                query=parse_qs(url.query)
+                if url.path=='/api/operations/bootstrap':
+                    result=app.operations.bootstrap()
+                elif url.path=='/api/operations/documents':
+                    result=app.operations.list_documents(query.get('kind',[None])[0])
+                elif url.path=='/api/operations/document':
+                    result=app.operations.get_document(query.get('id',[''])[0])
+                elif url.path=='/api/operations/journal':
+                    result=app.operations.journal()
+                else:
+                    raise ValueError('Раздел учёта не найден')
+                self.send(encode(result))
             elif url.path=='/api/status':
-                self.send(encode({'busy':app.busy,'message':app.message,'error':app.error,'loaded':app.report is not None}))
+                with app.lock:
+                    status={'busy':app.busy,'message':app.message,'error':app.error,'loaded':app.report is not None,
+                        'report_revision':app.report_revision,'history_revision':app.history_revision,'instance_id':app.instance_id}
+                self.send(encode(status))
             elif url.path=='/api/report':
-                if app.report is None:
+                with app.lock:
+                    report,revision=app.report,app.report_revision
+                if report is None:
                     raise ValueError('Данные еще не загружены')
                 excluded={'history','examples','shipments','backtest','sources','override'}
                 rows=[{k:v for k,v in r.items() if k not in excluded and k!='calculation'} |
-                    {'order_date':(r['calculation'] or {}).get('order_date') if r['ready'] else None} for r in app.report['rows']]
-                self.send(encode({**app.report,'rows':rows}))
+                    {'order_date':(r['calculation'] or {}).get('order_date') if r['ready'] else None} for r in report['rows']]
+                self.send(encode({**report,'rows':rows,'report_revision':revision,'instance_id':app.instance_id}))
             elif url.path=='/api/product':
                 key=parse_qs(url.query).get('key',[''])[0]
-                product=next((r for r in app.report['rows'] if r['key']==key),None)
+                report=app.report
+                if report is None:
+                    raise ValueError('Данные еще не загружены')
+                product=next((r for r in report['rows'] if r['key']==key),None)
                 if product is None:
                     raise ValueError('SKU не найден')
                 self.send(encode(product))
             elif url.path=='/api/journal':
                 self.send(encode(app.store.history()))
+            elif url.path=='/api/history':
+                with app.lock:
+                    dataset,result=app.data,app.history_report
+                    revision,history_revision=app.report_revision,app.history_revision
+                first=dataset.monthly.month.min() if dataset is not None and len(dataset.monthly) else None
+                self.send(encode({'result':result,'report_revision':revision,'history_revision':history_revision,
+                    'dataset':dataset.fingerprint if dataset is not None else None,'instance_id':app.instance_id,
+                    'start':str((first+pd.DateOffset(months=6)).date())[:7] if first is not None else None,
+                    'end':str((dataset.as_of.to_period('M').to_timestamp()-pd.DateOffset(months=1)).date())[:7] if dataset is not None else None}))
             elif url.path in ('/api/export.zip','/api/export.xlsx'):
                 if app.report is None or app.busy:
                     raise ValueError('Дождитесь завершения расчета')
@@ -248,33 +403,65 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.local_request()
             length=int(self.headers.get('Content-Length','0'))
+            if self.path=='/api/chat' and length>200_000:
+                raise ValueError('Слишком длинный диалог')
+            if self.path.startswith('/api/operations/') and length>2_000_000:
+                raise ValueError('Документ слишком большой')
             if not 0<length<=50_000_000:
                 raise ValueError('Запрос слишком большой или пустой')
-            request=json.loads(self.rfile.read(length))
+            if self.headers.get_content_type()!='application/json':
+                raise ValueError('Ожидается запрос application/json')
+            try:
+                request=json.loads(self.rfile.read(length),parse_constant=reject_json_constant)
+            except (ValueError,UnicodeError):
+                raise ValueError('Некорректный JSON в запросе') from None
+            if not isinstance(request,dict):
+                raise ValueError('Ожидается объект с параметрами запроса')
+            if not isinstance(request,dict):
+                raise ValueError('Ожидается объект запроса')
             app=self.server.application
-            if self.path=='/api/calculate':
-                settings=validate_settings(request)
-                app.submit(lambda:app.calculate(settings))
+            if self.path.startswith('/api/operations/'):
+                if self.path=='/api/operations/entity':
+                    result=app.operations.save_entity(request.get('kind'),request.get('payload'))
+                elif self.path=='/api/operations/document':
+                    result=app.operations.save_document(request)
+                elif self.path=='/api/operations/transition':
+                    version=request.get('expected_version')
+                    if type(version) is not int or version<1:
+                        raise ValueError('Обновите карточку документа перед проведением или отменой')
+                    result=app.operations.transition(request.get('id'),request.get('action'),expected_version=version)
+                elif self.path=='/api/operations/import-report':
+                    if app.report is None or app.busy:
+                        raise ValueError('Сначала загрузите данные и дождитесь расчёта плана закупок')
+                    result=app.operations.import_products(app.report['rows'])
+                else:
+                    raise ValueError('Неизвестное действие учёта')
+                self.send(encode(result))
+                return
+            elif self.path=='/api/chat':
+                if app.busy:
+                    raise ValueError('Дождитесь завершения расчёта и повторите вопрос.')
+                self.send(encode(assistant_answer(request,app.report,encode)))
+                return
+            elif self.path=='/api/calculate':
+                expected=app.request_revision(request)
+                settings=validate_settings({key:value for key,value in request.items()
+                    if key not in ('expected_report_revision','expected_dataset','expected_instance_id')})
+                app.submit(lambda:app.calculate(settings),expected=expected)
+            elif self.path=='/api/history-run':
+                if app.data is None:
+                    raise ValueError('Сначала загрузите данные')
+                start,end=validate_period(request['start'],request['end'],app.data.as_of)
+                app.submit(lambda:app.evaluate_period(start,end))
             elif self.path=='/api/override':
-                app.override(request)
+                app.override(request,expected=app.request_revision(request))
             elif self.path=='/api/load-default':
                 paths=default_paths()
                 if not paths:
                     raise ValueError('Архивы в Downloads не найдены. Загрузите их через интерфейс.')
                 app.submit(lambda:app.load(paths))
             elif self.path=='/api/upload':
-                files=request.get('files',[])
-                if not 1<=len(files)<=2:
-                    raise ValueError('Загрузите один или два ZIP-архива')
-                folder=app.state_dir/'uploads'/uuid.uuid4().hex
-                folder.mkdir(parents=True)
-                paths=[]
-                for index,file in enumerate(files):
-                    # Client names never become filesystem paths.
-                    path=folder/f'archive-{index}.zip'
-                    path.write_bytes(base64.b64decode(file['content'],validate=True))
-                    paths.append(path)
-                app.submit(lambda:app.load(paths))
+                app.upload(request)
             else:
                 raise ValueError('Неизвестное действие')
             self.send(encode({'ok':True}),code=202)

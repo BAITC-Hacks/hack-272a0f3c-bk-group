@@ -6,6 +6,14 @@ if (!source || !target) throw new Error('Expected input JSON and output XLSX pat
 const tables = JSON.parse(await fs.readFile(source, 'utf8'));
 const workbook = Workbook.create();
 const sheets = [];
+function quantityNumberFormat(value) {
+  // A positive requirement must never appear as zero because of formatting.
+  if (typeof value === 'number' && value !== 0 && Math.abs(value) < 1e-6) {
+    return '0.######E+00;[Red](0.######E+00);0';
+  }
+  return Number.isInteger(value) ? '#,##0;[Red](#,##0);0'
+    : '#,##0.######;[Red](#,##0.######);0';
+}
 for (const [name, input] of Object.entries(tables)) {
   const sheet = workbook.worksheets.add(name);
   sheets.push(sheet);
@@ -33,7 +41,8 @@ for (const [name, input] of Object.entries(tables)) {
     sheet.getRange(`O5:O${values.length+4}`).format.columnWidth = 95;
     sheet.getRange(`O5:O${values.length+4}`).format.wrapText = true;
     if(values.length>1) {
-      sheet.getRange(`F6:L${values.length+4}`).setNumberFormat('#,##0.0;[Red](#,##0.0);0');
+      sheet.getRange(`F6:L${values.length+4}`).format.numberFormat =
+        values.slice(1).map(row => row.slice(5, 12).map(quantityNumberFormat));
       sheet.getRange(`M6:N${values.length+4}`).setNumberFormat('yyyy-mm-dd');
       for(let i=1;i<values.length;i++) {
         const lines=Math.max(Math.ceil(String(values[i][2]||'').length/48),Math.ceil(String(values[i][14]||'').length/86));
@@ -56,6 +65,8 @@ if (previewDir) {
     const image=await workbook.render({sheetName:sheets[i].name,range:i===0?'A2:F8':'A2:B10',scale:1.4,format:'png'});
     await fs.writeFile(`${previewDir}/sheet-${i}.png`,new Uint8Array(await image.arrayBuffer()));
   }
+  const quantities=await workbook.render({sheetName:sheets[0].name,range:'F5:L10',scale:1.4,format:'png'});
+  await fs.writeFile(`${previewDir}/quantities.png`,new Uint8Array(await quantities.arrayBuffer()));
   const scan=await workbook.inspect({kind:'match',searchTerm:'#REF!|#DIV/0!|#VALUE!|#NAME\\?|#NUM!|#NULL!',options:{useRegex:true,maxResults:20}});
   console.log(scan.ndjson);
 }

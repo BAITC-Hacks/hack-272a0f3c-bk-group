@@ -27,10 +27,16 @@ class Store:
             return json.loads(row[0]) if row else default
 
     def put(self, key, value, action):
-        payload = json.dumps(value, ensure_ascii=False)
+        self.put_many([(key, value, action)])
+
+    def put_many(self, records):
+        """Commit related state and audit entries together, or leave all unchanged."""
+        records = [(key, json.dumps(value, ensure_ascii=False, allow_nan=False), action)
+                   for key, value, action in records]
         with self.connect() as db:
-            db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key,payload))
-            db.execute('INSERT INTO journal(action,payload) VALUES (?,?)',(action,payload))
+            for key, payload, action in records:
+                db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key,payload))
+                db.execute('INSERT INTO journal(action,payload) VALUES (?,?)',(action,payload))
 
     def history(self):
         with self.connect() as db:

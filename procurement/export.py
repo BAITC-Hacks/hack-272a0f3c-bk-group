@@ -2,7 +2,10 @@
 import csv
 import io
 import json
+import hashlib
+import math
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -11,9 +14,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def safe_cell(value):
-    if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')):
+    if isinstance(value, str) and (value.startswith(('\t', '\r', '\n')) or value.lstrip().startswith(('=', '+', '-', '@'))):
         return "'" + value
     return value
+
+
+def supplier_filename(supplier, used):
+    """Write flat, portable names even when a source label contains a path."""
+    stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]', '_', str(supplier)).strip(' .')[:100] or 'Поставщик'
+    if stem.upper().split('.')[0] in {'CON','PRN','AUX','NUL', *(f'{p}{i}' for p in ('COM','LPT') for i in range(1,10))}:
+        stem = '_' + stem
+    candidate = f'{stem} - проект заказа.csv'
+    if candidate.casefold() in used:
+        suffix = hashlib.sha256(str(supplier).encode()).hexdigest()[:10]
+        candidate = f'{stem}-{suffix} - проект заказа.csv'
+    used.add(candidate.casefold())
+    return candidate
 
 
 def tables(report):
@@ -51,9 +67,14 @@ def export_zip(report):
     with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as archive:
         archive.writestr('План со статусами.csv',csv_bytes(all_tables['План закупки']))
         archive.writestr('Параметры.csv',csv_bytes(all_tables['Параметры и источники']))
+        used_names = {name.casefold() for name in archive.namelist()}
+        paired = list(zip(report['rows'], all_tables['План закупки'][1:]))
         for supplier in sorted({r['supplier'] for r in report['rows']}):
-            ready=[row for row in all_tables['План закупки'][1:] if row[0]==supplier and row[5] is not None and row[5]>0]
-            archive.writestr(f'{supplier} - проект заказа.csv',csv_bytes([all_tables['План закупки'][0]]+ready))
+            ready=[cells for row,cells in paired if row['supplier']==supplier
+                and row.get('ready') is True and row.get('status') != 'blocked'
+                and not row.get('blocks') and isinstance(row.get('quantity'), (int,float))
+                and math.isfinite(row['quantity']) and row['quantity']>0]
+            archive.writestr(supplier_filename(supplier, used_names),csv_bytes([all_tables['План закупки'][0]]+ready))
     return buffer.getvalue()
 
 

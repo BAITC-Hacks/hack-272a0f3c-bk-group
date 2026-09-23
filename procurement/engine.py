@@ -1,12 +1,13 @@
 """Combine source provenance, forecasts and date-aware purchasing gates."""
 from datetime import datetime, timezone
+from decimal import Decimal
 import math
 import numpy as np
 import pandas as pd
 
 from analysis.orders_analysis import build_invoice_lines, classify_invoice_line_patterns
 from analysis.procurement_logic import round_purchase_quantity
-from .forecast import evaluate_history, future_daily, safety_from_errors, select_method, METHODS
+from .forecast import evaluate_history, future_daily, safety_from_errors, selection_details, METHODS
 
 DEFAULTS = {'lead_days': 30, 'review_days': 14, 'service': 0.9,
     'parameters_confirmed': False, 'blank_months_zero': False,
@@ -43,31 +44,61 @@ def classify(data):
 
 def plan_inventory(daily, free_stock, shipments, safety, lead, pack, moq=0):
     """Project every date so late receipts cannot conceal an early shortage."""
-    stock = float(free_stock)
-    path, breach, shortage = [], None, None
+    if daily.empty or not isinstance(daily.index, pd.DatetimeIndex):
+        raise ValueError('Для расчёта требуется непустой ежедневный прогноз')
+    expected = pd.date_range(daily.index[0].normalize(), periods=len(daily), freq='D')
+    if not daily.index.equals(expected):
+        raise ValueError('Даты прогноза должны идти подряд, без повторов и пропусков')
+    if not np.isfinite(daily.to_numpy(dtype=float)).all() or daily.lt(0).any():
+        raise ValueError('Ежедневный спрос должен быть конечным неотрицательным числом')
+    if not math.isfinite(float(free_stock)) or not math.isfinite(float(safety)) or safety < 0:
+        raise ValueError('Остаток и страховой запас должны быть конечными числами; запас неотрицательным')
+    if not math.isfinite(float(lead)) or lead < 1 or int(lead) != lead:
+        raise ValueError('Срок поставки должен быть целым положительным числом дней')
+    # Validate purchasing constraints even when no order is necessary.
+    round_purchase_quantity(0, pack, moq)
+    as_of = daily.index[0] - pd.Timedelta(days=1)
+    receipts = {}
+    for shipment in shipments:
+        arrival = pd.Timestamp(shipment['arrival'])
+        quantity = float(shipment['quantity'])
+        if pd.isna(arrival) or not math.isfinite(quantity) or quantity < 0:
+            raise ValueError('У поставки должна быть известная дата и конечное неотрицательное количество')
+        arrival = arrival.normalize()
+        if arrival <= as_of:
+            raise ValueError('Поставка на дату складского среза или раньше требует сверки')
+        if arrival <= daily.index[-1]:
+            receipts[arrival] = receipts.get(arrival, Decimal(0)) + Decimal(str(quantity))
+    # Keep full decimal stock arithmetic. Rounded chart values must never
+    # become inputs to purchasing (metres/kg may use fractions below .001).
+    stock, safety_value = Decimal(str(float(free_stock))), Decimal(str(float(safety)))
+    path, balances = [], []
+    breach = as_of if stock < safety_value else None
+    shortage = as_of if stock < 0 else None
     for day, demand in daily.items():
-        stock += sum(s['quantity'] for s in shipments if s['arrival'] == day)
-        stock -= float(demand)
-        if stock < safety and breach is None:
+        stock += receipts.get(day, Decimal(0))
+        stock -= Decimal(str(float(demand)))
+        if stock < safety_value and breach is None:
             breach = day
         if stock < 0 and shortage is None:
             shortage = day
-        path.append({'date': str(day.date()), 'without_order': round(stock, 3)})
-    as_of = daily.index[0] - pd.Timedelta(days=1)
+        balances.append((day, stock))
+        path.append({'date': str(day.date()), 'without_order': float(stock)})
     deadline = breach - pd.Timedelta(days=lead) if breach is not None else None
     order_day = max(deadline, as_of) if deadline is not None else as_of
     arrival = order_day + pd.Timedelta(days=lead)
-    after_arrival = [r['without_order'] for r in path if pd.Timestamp(r['date']) >= arrival]
-    raw = max(0, safety - min(after_arrival)) if after_arrival else 0
+    after_arrival = [value for day, value in balances if day >= arrival]
+    raw = float(max(Decimal(0), safety_value - min(after_arrival))) if after_arrival else 0
     quantity = round_purchase_quantity(raw, pack, moq)
-    for row in path:
-        row['with_order'] = round(row['without_order'] + (quantity if pd.Timestamp(row['date']) >= arrival else 0), 3)
+    for row, (day, value) in zip(path, balances):
+        row['with_order'] = float(value + (Decimal(str(quantity)) if day >= arrival else Decimal(0)))
     return {'raw_required': raw, 'recommended_quantity': quantity, 'trajectory': path,
         'order_date': str(max(deadline, as_of).date()) if deadline is not None and quantity>0 else None,
         'latest_safe_order_date': str(deadline.date()) if deadline is not None else None,
         'shortage_date': str(shortage.date()) if shortage is not None else None,
         'early_shortage': bool(shortage is not None and shortage < arrival),
-        'arrival_date': str(arrival.date()) if quantity>0 else None, 'incoming_in_horizon': sum(s['quantity'] for s in shipments)}
+        'arrival_date': str(arrival.date()) if quantity>0 else None,
+        'incoming_in_horizon': float(sum(receipts.values(), Decimal(0)))}
 
 
 def grouped(frame, fields):
@@ -133,6 +164,12 @@ def build_report(data, lines, values=None, overrides=None, progress=None):
             else:
                 history = m.set_index('month').quantity.sort_index().astype(float)
                 sources['monthly'] = m.source.iloc[0]
+                if history.index.isna().any():
+                    blocks.append('Неизвестная дата в помесячной истории')
+                    history = history[history.index.notna()]
+                if np.isinf(history.to_numpy()).any():
+                    blocks.append('Некорректные бесконечные значения в помесячной истории')
+                    history = history.replace([np.inf, -np.inf], np.nan)
         else:
             blocks.append('Нет помесячной истории')
         if len(history):
@@ -153,7 +190,8 @@ def build_report(data, lines, values=None, overrides=None, progress=None):
             warnings.append('Нет детализации накладных для анализа партий; используется месячная история')
         elif not settings['constraints_confirmed']:
             warnings.append('Анализ партий предварительный: подтвердите упаковку и минимальную партию')
-        if len(s) and s.duplicated().any():
+        sale_identity = [column for column in s.columns if column != 'source']
+        if len(s) and s.duplicated(subset=sale_identity).any():
             blocks.append('Полные дубли продаж: требуется сверка, автоматическое удаление отключено')
         negative_rows = int(s['Количество'].lt(0).sum()) if len(s) else 0
         if negative_rows:
@@ -173,7 +211,7 @@ def build_report(data, lines, values=None, overrides=None, progress=None):
                     continue
                 # Adjust only where transaction net total reconciles to the monthly source.
                 net = s.loc[s.date.dt.to_period('M').eq(period), 'Количество'].sum()
-                if not np.isclose(net, history.loc[month], atol=0.01):
+                if not np.isclose(net, history.loc[month], atol=0.01, rtol=0):
                     scenario_available = False
                     continue
                 adjusted.loc[month] = max(0, history.loc[month] - (rows.qty - rows.threshold).clip(lower=0).sum())
@@ -196,28 +234,32 @@ def build_report(data, lines, values=None, overrides=None, progress=None):
         daily = future_daily(selected_history, as_of, horizon)
         full_daily = daily if settings['scenario']=='full' else future_daily(history, as_of, horizon)
         robust_daily = full_daily if adjusted.equals(history) else (daily if settings['scenario']=='robust' else future_daily(adjusted, as_of, horizon))
-        if daily.isna().any():
+        if not np.isfinite(daily.to_numpy()).all():
             blocks.append('Нет надежного прогноза')
         snap = snapshots.get(key, pd.DataFrame())
         free, on_hand, reserved, snapshot_date = None, None, None, None
         if len(snap) == 1:
             row = snap.iloc[0]
-            on_hand, reserved = row.on_hand, row.reserved
+            on_hand, reserved = number_or_none(row.on_hand), number_or_none(row.reserved)
             snapshot_date = row.snapshot_date
             sources['snapshot'] = row.source
-            if pd.notna(on_hand) and pd.notna(reserved):
+            if on_hand is not None and reserved is not None:
                 free = float(on_hand - reserved)
-                if 'on_hand' not in override and pd.notna(row.free_stock) and not np.isclose(free, row.free_stock, atol=0.01):
+                if 'on_hand' not in override and pd.notna(row.free_stock) and not np.isclose(free, row.free_stock, atol=0.01, rtol=0):
                     blocks.append('Свободный остаток не равен остатку минус резерв')
         elif len(snap) > 1:
             blocks.append('Дубли SKU в текущем складском срезе')
         if override.get('on_hand') is not None and override.get('reserved') is not None:
-            on_hand, reserved = override['on_hand'], override['reserved']
-            free = float(on_hand - reserved)
+            on_hand, reserved = number_or_none(override['on_hand']), number_or_none(override['reserved'])
+            free = float(on_hand - reserved) if on_hand is not None and reserved is not None else None
             snapshot_date = pd.Timestamp(override['snapshot_date'])
             sources['snapshot'] = 'Ручной ввод: ' + override['reason']
         if free is None:
             blocks.append('Нет текущего остатка и резерва')
+        if reserved is not None and reserved < 0:
+            blocks.append('Отрицательный резерв: требуется сверка складского среза')
+        if free is not None and free < 0:
+            warnings.append('Резерв превышает остаток: уже есть нехватка для подтверждённых обязательств')
         if snapshot_date is None or pd.isna(snapshot_date):
             blocks.append('Неизвестна дата текущего остатка')
         elif not 0 <= (as_of - snapshot_date).days <= settings['max_snapshot_age']:
@@ -243,27 +285,45 @@ def build_report(data, lines, values=None, overrides=None, progress=None):
         if not settings['reserve_policy_confirmed']:
             blocks.append('Подтвердите, что резерв — дополнительный спрос вне прогноза')
         ship = shipments.get(key, pd.DataFrame())
+        shipment_identity = [field for field in ('supplier', 'sku', 'arrival', 'quantity', 'shipment', 'snapshot_date')
+                             if field in ship.columns]
+        if len(ship) and ship.duplicated(subset=shipment_identity).any():
+            blocks.append('Повторяющиеся строки поставок: подтвердите, что это отдельные партии')
         incoming = []
         all_shipments = []
         for r in ship.to_dict('records'):
             all_shipments.append(r)
-            arrival = r['arrival']
+            arrival = pd.Timestamp(r['arrival'])
+            quantity = number_or_none(r['quantity'])
+            if quantity is None or quantity < 0:
+                blocks.append('Некорректное количество в поставке: требуется сверка')
+                continue
+            if pd.notna(arrival):
+                arrival = arrival.normalize()
             if pd.isna(arrival) or arrival <= as_of:
-                blocks.append('У поставки отсутствует дата или она уже просрочена')
+                blocks.append('Дата поставки неизвестна или не позже складского среза: требуется сверка')
             elif arrival <= as_of + pd.Timedelta(days=horizon):
-                incoming.append({'arrival':arrival,'quantity':float(r['quantity'])})
+                incoming.append({'arrival':arrival,'quantity':quantity})
         if not settings['incoming_confirmed']:
             blocks.append('Подтвердите полноту поставок, их даты и единицы')
         calculation = None
-        if free is not None and safety is not None and not daily.isna().any() and pack is not None and pack > 0:
-            calculation = plan_inventory(daily, free, incoming, safety, settings['lead_days'], pack,
-                                         override.get('minimum_order_quantity',0) or 0)
+        if free is not None and safety is not None and np.isfinite(daily.to_numpy()).all() and pack is not None and pack > 0:
+            try:
+                calculation = plan_inventory(daily, free, incoming, safety, settings['lead_days'], pack,
+                                             override.get('minimum_order_quantity',0) or 0)
+            except (ValueError, OverflowError) as error:
+                blocks.append('Невозможно рассчитать закупку: ' + str(error))
         if calculation and calculation['early_shortage']:
             warnings.append('Дефицит раньше новой поставки: нужны ускорение или перемещение')
         ready = not blocks and calculation is not None
         status = 'blocked' if not ready else ('urgent' if calculation['early_shortage'] else ('order' if calculation['recommended_quantity'] > 0 else 'covered'))
+        forecast_schedule = []
+        for period in daily.index.to_period('M').unique():
+            details = selection_details(selected_history, period.to_timestamp())
+            forecast_schedule.append({'month':str(period), **details, 'label':METHODS[details['method']]})
         result.append({**product, 'status':status, 'blocks':list(dict.fromkeys(blocks)), 'warnings':warnings,
-            'forecast_method':METHODS[select_method(selected_history,as_of.to_period('M').to_timestamp())],
+            'forecast_method':forecast_schedule[0]['label'],
+            'forecast_selection':forecast_schedule[0], 'forecast_schedule':forecast_schedule,
             'forecast_horizon':number_or_none(daily.sum(min_count=1)),
             'full_forecast':number_or_none(full_daily.sum(min_count=1)),
             'robust_forecast':number_or_none(robust_daily.sum(min_count=1)) if scenario_available else None,
@@ -297,7 +357,7 @@ def build_report(data, lines, values=None, overrides=None, progress=None):
             'candidate_lines':int(lines.pattern_class.eq('candidate_one_off').sum()),
             'recurring_lines':int(lines.pattern_class.eq('repeating_wholesale_batch').sum()),
             'invalid_sales_rows':int((data.sales.date.isna() | data.sales['Количество'].isna() | data.sales['Код'].eq('')).sum()),
-            'duplicate_sales_rows':int(data.sales.duplicated().sum())},
+            'duplicate_sales_rows':int(data.sales.duplicated(subset=[column for column in data.sales.columns if column != 'source']).sum())},
         'limitations':['Прогноз основан на отгрузках. Неудовлетворённый спрос в него не включён.',
             f'Незавершённый месяц ({as_of:%Y-%m}) исключён из обучения.',
             'Backtest: последние 6 завершенных месяцев, фиксированные модели, только прошлое в каждом прогнозе.',
